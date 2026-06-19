@@ -19,7 +19,7 @@ use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DbErr, EntityOrSelect, EntityTrait,
     FromQueryResult, QueryFilter, QuerySelect, QueryTrait, RelationTrait, Statement,
 };
-use sea_query::{JoinType, SelectStatement};
+use sea_query::{JoinType, SelectStatement, UnionType};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -312,23 +312,65 @@ impl InnerService {
                 .column(sbom_node::Column::SbomId)
                 .distinct()
                 .into_query(),
-            GraphQuery::Query(query) => sbom_node::Entity::find()
-                .join(JoinType::Join, sbom_node::Relation::Package.def())
-                .join(JoinType::LeftJoin, sbom_package::Relation::Purl.def())
-                .join(JoinType::LeftJoin, sbom_package::Relation::Cpe.def())
-                .join(
-                    JoinType::LeftJoin,
-                    sbom_package_cpe_ref::Relation::Cpe.def(),
-                )
-                .join(
-                    JoinType::LeftJoin,
-                    sbom_package_purl_ref::Relation::Purl.def(),
-                )
-                .select_only()
-                .column(sbom_node::Column::SbomId)
-                .filtering_with(query.clone(), q_columns())?
-                .distinct()
-                .into_query(),
+            GraphQuery::Query(query) => {
+                let node_result = sbom_node::Entity::find()
+                    .select_only()
+                    .column(sbom_node::Column::SbomId)
+                    .filtering_with(query.clone(), q_node_columns())
+                    .map(|s| s.distinct().into_query());
+
+                if let Ok(mut node_query) = node_result {
+                    if let Ok(cpe_query) = sbom_node::Entity::find()
+                        .join(JoinType::Join, sbom_node::Relation::Package.def())
+                        .join(JoinType::LeftJoin, sbom_package::Relation::Cpe.def())
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package_cpe_ref::Relation::Cpe.def(),
+                        )
+                        .select_only()
+                        .column(sbom_node::Column::SbomId)
+                        .filtering_with(query.clone(), q_cpe_columns())
+                        .map(|s| s.distinct().into_query())
+                    {
+                        node_query.union(UnionType::Distinct, cpe_query);
+                    }
+
+                    if let Ok(purl_query) = sbom_node::Entity::find()
+                        .join(JoinType::Join, sbom_node::Relation::Package.def())
+                        .join(JoinType::LeftJoin, sbom_package::Relation::Purl.def())
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package_purl_ref::Relation::Purl.def(),
+                        )
+                        .select_only()
+                        .column(sbom_node::Column::SbomId)
+                        .filtering_with(query.clone(), q_purl_columns())
+                        .map(|s| s.distinct().into_query())
+                    {
+                        node_query.union(UnionType::Distinct, purl_query);
+                    }
+
+                    node_query
+                } else {
+                    sbom_node::Entity::find()
+                        .join(JoinType::Join, sbom_node::Relation::Package.def())
+                        .join(JoinType::LeftJoin, sbom_package::Relation::Purl.def())
+                        .join(JoinType::LeftJoin, sbom_package::Relation::Cpe.def())
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package_cpe_ref::Relation::Cpe.def(),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package_purl_ref::Relation::Purl.def(),
+                        )
+                        .select_only()
+                        .column(sbom_node::Column::SbomId)
+                        .filtering_with(query.clone(), q_columns())?
+                        .distinct()
+                        .into_query()
+                }
+            }
         };
 
         self.load_graphs_subquery(connection, search_sbom_subquery)
@@ -384,28 +426,105 @@ impl InnerService {
                     .all(connection)
                     .await?,
             ),
-            GraphQuery::Query(query) => (
-                true,
-                select()
-                    // required for purl and cpe refs
-                    .join(JoinType::InnerJoin, sbom_node::Relation::Package.def())
-                    // required for querying purls
-                    .join(JoinType::LeftJoin, sbom_package::Relation::Purl.def())
-                    .join(
-                        JoinType::LeftJoin,
-                        sbom_package_purl_ref::Relation::Purl.def(),
+            GraphQuery::Query(query) => {
+                if select()
+                    .filtering_with(query.clone(), q_node_columns())
+                    .is_ok()
+                {
+                    let mut all_rows: Vec<Row> = Vec::new();
+
+                    if let Ok(node_select) =
+                        select().filtering_with(query.clone(), q_node_columns())
+                    {
+                        log::debug!("query-node branch: executing");
+                        all_rows.extend(
+                            node_select.into_model().all(connection).await?,
+                        );
+                    }
+
+                    if let Ok(cpe_select) = select()
+                        .join(
+                            JoinType::InnerJoin,
+                            sbom_node::Relation::Package.def(),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package::Relation::Cpe.def(),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package_cpe_ref::Relation::Cpe.def(),
+                        )
+                        .filtering_with(query.clone(), q_cpe_columns())
+                    {
+                        log::debug!("query-cpe branch: executing");
+                        all_rows.extend(
+                            cpe_select.into_model().all(connection).await?,
+                        );
+                    }
+
+                    if let Ok(purl_select) = select()
+                        .join(
+                            JoinType::InnerJoin,
+                            sbom_node::Relation::Package.def(),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package::Relation::Purl.def(),
+                        )
+                        .join(
+                            JoinType::LeftJoin,
+                            sbom_package_purl_ref::Relation::Purl.def(),
+                        )
+                        .filtering_with(query.clone(), q_purl_columns())
+                    {
+                        log::debug!("query-purl branch: executing");
+                        all_rows.extend(
+                            purl_select.into_model().all(connection).await?,
+                        );
+                    }
+
+                    all_rows.sort_by(|a, b| {
+                        a.sbom_id
+                            .cmp(&b.sbom_id)
+                            .then_with(|| a.node_id.cmp(&b.node_id))
+                    });
+                    all_rows.dedup_by(|a, b| {
+                        a.sbom_id == b.sbom_id && a.node_id == b.node_id
+                    });
+
+                    (true, all_rows)
+                } else {
+                    (
+                        true,
+                        select()
+                            .join(
+                                JoinType::InnerJoin,
+                                sbom_node::Relation::Package.def(),
+                            )
+                            .join(
+                                JoinType::LeftJoin,
+                                sbom_package::Relation::Purl.def(),
+                            )
+                            .join(
+                                JoinType::LeftJoin,
+                                sbom_package_purl_ref::Relation::Purl.def(),
+                            )
+                            .join(
+                                JoinType::LeftJoin,
+                                sbom_package::Relation::Cpe.def(),
+                            )
+                            .join(
+                                JoinType::LeftJoin,
+                                sbom_package_cpe_ref::Relation::Cpe.def(),
+                            )
+                            .filtering_with(query.clone(), q_columns())?
+                            .into_model()
+                            .all(connection)
+                            .await?,
                     )
-                    // required for querying CPEs
-                    .join(JoinType::LeftJoin, sbom_package::Relation::Cpe.def())
-                    .join(
-                        JoinType::LeftJoin,
-                        sbom_package_cpe_ref::Relation::Cpe.def(),
-                    )
-                    .filtering_with(query.clone(), q_columns())?
-                    .into_model()
-                    .all(connection)
-                    .await?,
-            ),
+                }
+            }
         };
 
         log::debug!("test latest sbom ids: {:?}", matched_sbom_ids);
@@ -721,6 +840,52 @@ fn q_columns() -> Columns {
                 _ => None,
             }
         })
+}
+
+fn q_node_columns() -> Columns {
+    sbom_node::Entity.columns()
+}
+
+fn q_cpe_columns() -> Columns {
+    cpe::Entity.columns().translator(|f, op, v| match f {
+        "cpe" => match (op, OwnedUri::from_str(v)) {
+            ("=" | "~", Ok(cpe)) => {
+                let q = match (cpe.part(), cpe.language()) {
+                    (CpeType::Any, Language::Any) => String::new(),
+                    (CpeType::Any, l) => format!("language={l}"),
+                    (p, Language::Any) => format!("part={p}"),
+                    (p, l) => format!("part={p}&language={l}"),
+                };
+                let q = [
+                    ("vendor", cpe.vendor()),
+                    ("product", cpe.product()),
+                    ("version", cpe.version()),
+                    ("update", cpe.update()),
+                    ("edition", cpe.edition()),
+                ]
+                .iter()
+                .fold(q, |acc, (k, v)| match v {
+                    Component::Value(s) => {
+                        format!("{acc}&{k}={s}|*")
+                    }
+                    _ => acc,
+                });
+                Some(q)
+            }
+            ("~", Err(_)) => Some(v.into()),
+            (_, Err(e)) => Some(e.to_string()),
+            (_, _) => Some("illegal operation for cpe field".into()),
+        },
+        _ => None,
+    })
+}
+
+fn q_purl_columns() -> Columns {
+    qualified_purl::Entity.columns().translator(|f, op, v| match f {
+        "purl:type" => Some(format!("purl:ty{op}{v}")),
+        "purl" => Purl::translate(op, v),
+        _ => None,
+    })
 }
 
 async fn sbom_id(id: Uuid, connection: &impl ConnectionTrait) -> anyhow::Result<Option<String>> {
